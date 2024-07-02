@@ -17,10 +17,10 @@ from utils import Logger, ReplayBuffer
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_episode", type=int, default=500)
+    parser.add_argument("--train-episode", type=int, default=500)
     parser.add_argument("--stop", type=int, default=300, help="Earily stop score")
     parser.add_argument("--show", type=int, default=0, help="0 for save gif, 1 for show windows")
-    parser.add_argument("--test_episode", type=int, default=5)
+    parser.add_argument("--test-episode", type=int, default=5)
     parser.add_argument("--gamma", type=float, default=0.9)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--seed", type=int, default=0)
