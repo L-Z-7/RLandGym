@@ -175,10 +175,11 @@ class ReplayBuffer:
         self.size = buf_size
         self.len = 0
         self.idx = 0
-        self.attrs = []
+        self.attrs = {}
         self.random = np.random.RandomState()
 
     def store(self, **argkv):
+        """Store the exp"""
         if len(self.attrs) == 0:
             for k, v in argkv.items():
                 if isinstance(v, list) or isinstance(v, tuple):
@@ -190,37 +191,75 @@ class ReplayBuffer:
                 else:
                     dtype = type(v)
 
-                self.attrs.append(k)
+                self.attrs[k] = dtype
                 setattr(self, k, np.ndarray(
                     (self.size,) + np.array(v).shape if dtype != object else (self.size,), 
                     dtype=dtype))
 
         for k, v in argkv.items():
+            if k not in self.attrs:
+                raise KeyError(
+                    f"The buffer only has keys: {self.attrs}; but want to store {k}!")
             getattr(self, k)[self.idx] = v
         self.idx = (self.idx + 1) % self.size
         self.len = min(self.size, self.len + 1)
 
     def clear(self):
+        """Clear the buffer."""
         self.len = 0
         self.idx = 0
 
-    def sample(self, batch_size=1):
+    def sample(self, batch_size=-1, shuffle=True) -> dict:
+        """
+        Sample exp from the buffer. \n
+        Batch_size -1 for get all exp; \n
+        Shuffle True for shuffle the exp it sampled.
+        """
+        if batch_size < 0:
+            batch_size = self.len
         if batch_size > self.len:
             raise RuntimeError(f"ReplayBuffer only has {self.len} exp, but it want to get {batch_size}!")
+        
         idx = self.random.choice(self.len, batch_size, replace=False)
-        return { k: getattr(self, k)[idx] for k in self.attrs }
+        
+        if not shuffle:
+            idx = sorted(idx)
+        return {
+            k: getattr(self, k)[idx]
+            for k in self.attrs
+        }
 
     def seed(self, seed):
+        """The random seed for sample func."""
         self.random = np.random.RandomState(seed)
 
     def __len__(self):
         return self.len
 
+    def isfull(self):
+        """When the num of exp is equal to the buffer size."""
+        return self.len == self.size
+    
+    def isempty(self):
+        """When the num of exp is zero."""
+        return self.len == 0
+
 if __name__ == '__main__':
-    buf = ReplayBuffer(10)
+    buf = ReplayBuffer(2)
+    assert buf.isempty()
+
     buf.store(state=torch.rand([1, 3]), next_state=[1,2,3], action=1, reward=0.5)
+    assert not buf.isfull()
     buf.store(state=torch.rand([1, 3]), next_state=[2,3,1], action=2, reward=0.7)
-    print(buf.sample(1))
-    print(len(buf))
+    assert buf.isfull()
+    for k, v in buf.sample(2).items():
+        print(k)
+        print(v)
+    print("Cur num of exp:", len(buf))
+
+    try:
+        buf.store(states=1)
+    except KeyError:
+        print('KeyError test pass.')
 
     # print(buf.sample(4))
