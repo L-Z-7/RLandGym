@@ -179,8 +179,6 @@ class Agent:
                     self.scheduler.step()
                     scores.append(score)
                     self.logging.save_tensorboard('train-score', score, episode)
-                    # print("episode {}: total action {}; score {}; use time {}; ".format(
-                    #         episode, num_action, score, time() - start_time))
 
                     if episode % 10 == 0:
                         self.logging.save_model(self.net)
@@ -191,17 +189,16 @@ class Agent:
                 print(f'[Train] Get score {np.mean(scores[-5:])} (greater than {stop_score}), earily stop in Ep {episode}.')
                 self.logging.save_model(self.net)
                 break
-        # self.logging.save_npy(np.array(losses), info='train-loss')
 
     def test(self, num_episode_test, load_last = True, show=False):
         self.greedy(True)
-        # load the best model to test
+        # load the last model to test
         if load_last:
             print(f'[Test] load last mode in {self.logging.date}')
             self.logging.load_model(self.net)
 
         frames, scores = [], []
-        for episode in range(num_episode_test):
+        for episode in range(1, num_episode_test+1):
             state, info = self.env.reset(seed=self.random.randint(1e9))
 
             done = False
@@ -227,7 +224,6 @@ class Agent:
         self.net.train(not greedy_model)
 
     def _state_process(self, state) -> torch.Tensor:
-        # gym官网提供的归一化
         state = state / [2.4, 1, 0.21, 1]
 
         if isinstance(state, np.ndarray):
@@ -238,7 +234,7 @@ class Agent:
 
 def seed_torch(seed):
     torch.manual_seed(seed)
-    if torch.backends.cudnn.enabled:  # 这个如果是True， 可以提升运算效率
+    if torch.backends.cudnn.enabled:
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.determinstic = True
 
@@ -265,7 +261,8 @@ if __name__ == '__main__':
                   logging=logging, seed=args.seed)
 
     try:
-        agent.train(args.train_episode, args.stop, show=args.show)
+        if not args.last:
+            agent.train(args.train_episode, args.stop, show=args.show)
         agent.test(args.test_episode, load_last=args.last, show=args.show)
     except:
         traceback.print_exc()
