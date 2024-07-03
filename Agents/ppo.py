@@ -18,14 +18,21 @@ from utils import Logger, ReplayBuffer
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-episode", type=int, default=500)
-    parser.add_argument("--stop", type=int, default=300, help="Earily stop score")
-    parser.add_argument("--show", type=int, default=0, help="0 for save gif, 1 for show windows")
     parser.add_argument("--test-episode", type=int, default=5)
+    parser.add_argument("--stop", type=int, default=300, help="Earily stop score")
+
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for update")
+    parser.add_argument("--update-step", type=int, default=10, help="Loop update steps")
+    
     parser.add_argument("--gamma", type=float, default=0.9)
+    parser.add_argument("--lmbda", type=float, default=0.95)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--tag", type=str, default='CP_A2C')
+    
+    parser.add_argument("--show", type=int, default=0, help="0 for save gif, 1 for show windows")
     parser.add_argument("--last", type=int, default=0, help="0 for new, 1 for last time")
+
+    parser.add_argument("--tag", type=str, default='CP_PPO')
 
     args = parser.parse_known_args()[0]
     return args
@@ -70,6 +77,8 @@ class Agent:
             env: gym.Env,
             buf: ReplayBuffer,
             gamma: float = 0.9,
+            lmbda: float = 1,
+            epsilon: float = 0.2,
             learning_rate: float = 3e-4,
             logging: Logger = None,
             device = None,
@@ -83,7 +92,9 @@ class Agent:
 
         self.env = env
         self.buf = buf
+        self.lmbda = lmbda
         self.gamma = gamma
+        self.epsilon = epsilon
 
         self.device = device if device is not None else \
                       torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -93,7 +104,7 @@ class Agent:
         self.optimizer = optim.Adam(self.net.parameters(), lr=learning_rate)
         self.scheduler = scheduler.StepLR(self.optimizer, step_size=100, gamma=0.8)
 
-        self.logging = logging
+        self.logging = Logger('./log', 'ppo') if logging is None else logging
 
     def select(self, state: np.ndarray) -> np.ndarray:
         """Select an action from the input state."""
@@ -114,33 +125,61 @@ class Agent:
         done = terminated or truncated
         return next_state, reward, done, info
 
-    def update_model(self):
-        exp = self.buf.sample(batch_size=1)
-        value = exp['value'][0]
-        log_prob = exp['log_prob'][0]
-        reward = exp['reward']
-        next_state = exp['next_state']
-        done = exp['done']
+    def update_model(self, update_step: int):
+        exp = self.buf.sample(shuffle=False)
+        states = exp['state'] # [B, H]
+        actions = exp['action'] # [B]
+        rewards = exp['reward'] # [B]
+        next_states = exp['next_state'] # [B, H]
+        dones = exp['done'] # [B]
 
-        reward = torch.FloatTensor(reward).unsqueeze(1).to(self.device)
-        done = torch.FloatTensor(done).unsqueeze(1).to(self.device)
+        # [B] -> [B,1]
+        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)
+        dones = torch.FloatTensor(dones).unsqueeze(1).to(self.device)
+        actions = torch.FloatTensor(actions).unsqueeze(1).to(self.device)
 
-        _, next_value = self.net(self._state_process(next_state))
-        target = reward + self.gamma * next_value.detach() * (1-done)
-        advantage = target - value
+        policies, values = self.net(self._state_process(states))
+        _, next_values = self.net(self._state_process(next_states))
+        next_values = next_values.detach()
 
-        actor_loss  = -(log_prob * advantage.detach()).mean()
-        critic_loss  = advantage.pow(2).mean()
-        loss = actor_loss + 0.5 * critic_loss
-        loss = loss.mean()
+        log_probs_old = policies.log_prob(actions)
+        targets = rewards + self.gamma * next_values * (1-dones)
+        # detach
+        log_probs_old, targets = log_probs_old.detach(), targets.detach()
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        # cal the gae
+        td_err = targets - values
+        gae = torch.zeros_like(td_err)
+        for t in reversed(range(len(td_err) - 1)):
+            gae[t] = td_err[t] + self.gamma * self.lmbda * gae[t+1]
+        gae = gae.detach()
 
-        return loss.item()
+        losses = []
+        for _ in range(update_step):
+            policies, values = self.net(self._state_process(states))
+            log_probs = policies.log_prob(actions)
+            entropy = policies.entropy()
 
-    def train(self, num_episode: int, stop_score=np.inf, show=True):
+            # pi / pi_old
+            ratio = torch.exp(log_probs - log_probs_old)
+            
+            surr1 = ratio * gae
+            surr2 = torch.clamp(ratio, 1-self.epsilon, 1+self.epsilon) * gae
+
+            actor_loss  = -torch.min(surr1, surr2)
+            critic_loss  = F.mse_loss(values, targets)
+            loss = actor_loss + 0.5 * critic_loss - 0.02*entropy
+            loss = loss.mean()
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            losses.append(loss.item())
+
+        return np.mean(losses)
+
+    def train(self, num_episode: int, update_step: int, stop_score=np.inf, show=True):
         """Train the agent."""
         self.greedy(False)
         losses, scores = [], []
@@ -162,16 +201,21 @@ class Agent:
                 next_state, reward, done, info = self.step(action)
 
                 self.buf.store(
-                    value=value, 
-                    log_prob=action_info['log_prob'], 
+                    state=state,
+                    action=action,
                     reward=reward, 
                     next_state=next_state, 
                     done=done)
 
                 score += reward
-                loss = self.update_model()
-                self.logging.save_tensorboard('train-loss', loss, steps)
-                losses.append(loss)
+
+                # collected a batch exp
+                if self.buf.isfull():
+                    loss = self.update_model(update_step)
+                    self.logging.save_tensorboard('train-loss', loss, steps)
+                    losses.append(loss)
+
+                    self.buf.clear()
 
                 state = next_state
 
@@ -224,12 +268,17 @@ class Agent:
         self.net.train(not greedy_model)
 
     def _state_process(self, state) -> torch.Tensor:
+        if not isinstance(state, np.ndarray):
+            return state
+        
+        # norm
         state = state / [2.4, 1, 0.21, 1]
-
-        if isinstance(state, np.ndarray):
-            state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        state = torch.FloatTensor(state)
+        # only one state, reshape from [H] to [1, H]
+        if len(state.shape) == 1:
+            state.unsqueeze(0)
             
-        return state
+        return state.to(self.device)
 
 
 def seed_torch(seed):
@@ -251,18 +300,18 @@ if __name__ == '__main__':
         logging.save_argparse(args)
         logging.save_runtime()
 
-    buf = ReplayBuffer(buf_size=1)
+    buf = ReplayBuffer(buf_size=args.batch_size)
 
     buf.seed(args.seed)
     seed_torch(args.seed)
     
     agent = Agent(env, buf, 
-                  gamma=args.gamma, learning_rate=args.lr, 
+                  gamma=args.gamma, learning_rate=args.lr, lmbda=args.lmbda,
                   logging=logging, seed=args.seed)
 
     try:
         if not args.last:
-            agent.train(args.train_episode, args.stop, show=args.show)
+            agent.train(args.train_episode, args.update_step, stop_score=args.stop, show=args.show)
         agent.test(args.test_episode, load_last=args.last, show=args.show)
     except:
         traceback.print_exc()
